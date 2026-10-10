@@ -3,8 +3,6 @@
 Write LaTeX in [Zed](https://zed.dev) with a live PDF in [Skim](https://skim-app.sourceforge.io) on macOS:
 save to build, and jump between source and PDF in both directions.
 
-[中文说明](README.zh-CN.md)
-
 | | |
 |---|---|
 | `⌘S` | build with latexmk; Skim reloads and shows the line you are on |

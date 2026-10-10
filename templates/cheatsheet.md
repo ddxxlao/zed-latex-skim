@@ -1,6 +1,6 @@
 # Zed + Skim cheat sheet
 
-Root document: `@MAIN@`
+Root document: `@MAIN@` (`⌘⌥J` finds the right PDF for any file, even with several documents)
 
 | Action | Keys |
 |---|---|

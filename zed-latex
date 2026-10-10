@@ -5,6 +5,8 @@
                            Skim sync, add Zed keybindings
   zed-latex init [DIR]     write .zed/ (settings, tasks, cheat sheet) into a
                            LaTeX project
+  zed-latex sync W F L     show line L of F in Skim, in the PDF of the root
+                           document that includes F (Cmd-Alt-J)
 
 Runs on the system python3 (3.9+), standard library only.
 """
@@ -140,27 +142,102 @@ def cmd_setup(args):
 
 # ---- init -------------------------------------------------------------------
 
-def find_main_tex(root):
-    skip = {".git", "node_modules", ".zed"}
+SKIP_DIRS = {".git", "node_modules", ".zed"}
+INCLUDE_RE = re.compile(r"\\(?:input|include|subfile)\s*\{([^}]+)\}")
+TEX_ROOT_RE = re.compile(r"^\s*%\s*!\s*tex\s+root\s*=\s*(.+?)\s*$", re.I | re.M)
+
+
+def read_tex(path):
+    try:
+        return path.read_text(errors="ignore")
+    except OSError:
+        return ""
+
+
+def uncomment(text):
+    # Drop everything after an unescaped %.
+    return "\n".join(re.sub(r"(?<!\\)%.*", "", l) for l in text.splitlines())
+
+
+def is_root_document(path):
+    return re.search(r"^[^%\n]*\\documentclass", read_tex(path)[:20000], re.M) is not None
+
+
+def find_roots(root):
     found = []
     for dirpath, dirnames, filenames in os.walk(str(root)):
-        dirnames[:] = [d for d in dirnames if d not in skip]
-        for name in filenames:
-            if not name.endswith(".tex"):
-                continue
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for name in sorted(filenames):
             path = Path(dirpath) / name
-            try:
-                head = path.read_text(errors="ignore")[:20000]
-            except OSError:
-                continue
-            if re.search(r"^[^%\n]*\\documentclass", head, re.M):
+            if name.endswith(".tex") and is_root_document(path):
                 found.append(path)
+    return found
+
+
+def find_main_tex(root):
+    found = find_roots(root)
     if len(found) == 1:
         return found[0]
     mains = [p for p in found if p.name == "main.tex"]
     if len(mains) == 1:
         return mains[0]
     return None if not found else found
+
+
+def included_files(root_doc):
+    """Every file reachable from root_doc via \\input, \\include, \\subfile."""
+    base = root_doc.parent  # LaTeX resolves paths against the root's directory
+    seen, todo = set(), [root_doc.resolve()]
+    while todo:
+        path = todo.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        for name in INCLUDE_RE.findall(uncomment(read_tex(path))):
+            child = (base / name.strip())
+            if child.suffix != ".tex":
+                child = child.with_name(child.name + ".tex")
+            child = child.resolve()
+            if child.is_file():
+                todo.append(child)
+    return seen
+
+
+def root_for(tex_file, worktree):
+    """The root document whose PDF shows tex_file, or None."""
+    tex_file = tex_file.resolve()
+    magic = TEX_ROOT_RE.search(read_tex(tex_file)[:5000])
+    if magic:
+        return (tex_file.parent / magic.group(1)).resolve()
+    if is_root_document(tex_file):
+        return tex_file
+    owners = [r for r in find_roots(worktree) if tex_file in included_files(r)]
+    if not owners:
+        return None
+    # Shared files (e.g. macros.tex): prefer the PDF built most recently.
+    return max(owners, key=lambda r: r.with_suffix(".pdf").stat().st_mtime
+               if r.with_suffix(".pdf").exists() else 0)
+
+
+def notify(msg):
+    print(msg, file=sys.stderr)
+    subprocess.run(["osascript", "-e", "display notification %s with title \"zed-latex\""
+                    % json.dumps(msg)], capture_output=True)
+
+
+def cmd_sync(args):
+    tex_file = Path(args.file)
+    root_doc = root_for(tex_file, Path(args.worktree))
+    if root_doc is None:
+        notify("%s is not part of any root document" % tex_file.name)
+        sys.exit(1)
+    pdf = root_doc.with_suffix(".pdf")
+    if not pdf.exists():
+        notify("%s not built yet; save once to build it" % pdf.name)
+        sys.exit(1)
+    skim = find_skim() or Path("/Applications/Skim.app")
+    subprocess.run([str(skim / "Contents/SharedSupport/displayline"), "-r",
+                    str(args.line), str(pdf), str(tex_file.resolve())], check=True)
 
 
 def fill(template, subs):
@@ -211,6 +288,8 @@ def cmd_init(args):
         "DISPLAYLINE": displayline,
     })
 
+    # Shared configs cannot carry this machine's path; rely on PATH instead.
+    self_cmd = "zed-latex" if args.share else str(Path(__file__).resolve())
     cwd = "$ZED_WORKTREE_ROOT" + main_dir
     pdf = "$ZED_WORKTREE_ROOT/" + pdf_rel
     if has_make:
@@ -222,8 +301,8 @@ def cmd_init(args):
                  "cwd": cwd}
     build.update({"reveal": "no_focus", "hide": "on_success"})
     tasks = [
-        {"label": "latex: show line in Skim", "command": displayline,
-         "args": ["-r", "$ZED_ROW", pdf, "$ZED_FILE"],
+        {"label": "latex: show line in Skim", "command": self_cmd,
+         "args": ["sync", "$ZED_WORKTREE_ROOT", "$ZED_FILE", "$ZED_ROW"],
          "reveal": "never", "hide": "always", "allow_concurrent_runs": True},
         {"label": "latex: open PDF in Skim", "command": "open",
          "args": ["-a", "Skim", pdf], "reveal": "never", "hide": "always"},
@@ -285,6 +364,11 @@ def main():
                    help="do not hide .zed/ from git (commit it for co-authors)")
     i.add_argument("--force", action="store_true", help="overwrite an existing .zed/")
     i.set_defaults(func=cmd_init)
+    y = sub.add_parser("sync", help="show a source line in Skim (used by Cmd-Alt-J)")
+    y.add_argument("worktree")
+    y.add_argument("file")
+    y.add_argument("line", type=int)
+    y.set_defaults(func=cmd_sync)
     args = p.parse_args()
     if not getattr(args, "func", None):
         p.print_help()

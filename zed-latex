@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Zed + Skim LaTeX workflow for macOS.
+
+  zed-latex setup          one-time machine setup: check tools, configure
+                           Skim sync, add Zed keybindings
+  zed-latex init [DIR]     write .zed/ (settings, tasks, cheat sheet) into a
+                           LaTeX project
+
+Runs on the system python3 (3.9+), standard library only.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TEMPLATES = HERE / "templates"
+
+SKIM_DOMAIN = "net.sourceforge.skim-app.skim"
+KEYMAP = Path.home() / ".config" / "zed" / "keymap.json"
+KEYMAP_BLOCK = {
+    "context": "Editor && extension == tex",
+    "bindings": {
+        "cmd-alt-j": ["task::Spawn", {"task_name": "latex: show line in Skim"}],
+        "cmd-alt-b": ["task::Spawn", {"task_name": "latex: build"}],
+    },
+}
+DEFAULT_NOTE_TAGS = "TODO|FIXME|REVIEW"
+ENGINES = {"pdflatex": "-pdf", "xelatex": "-pdfxe", "lualatex": "-pdflua"}
+
+
+def say(status, msg):
+    print("%-5s %s" % (status, msg))
+
+
+def find_skim():
+    for base in ("/Applications", str(Path.home() / "Applications")):
+        app = Path(base) / "Skim.app"
+        if app.exists():
+            return app
+    return None
+
+
+# ---- setup ------------------------------------------------------------------
+
+def check_tools():
+    ok = True
+    for tool, hint in [
+        ("latexmk", "install MacTeX: brew install --cask mactex-no-gui"),
+        ("pdflatex", "install MacTeX: brew install --cask mactex-no-gui"),
+        ("zed", "in Zed: command palette > 'cli: install'"),
+    ]:
+        path = shutil.which(tool)
+        if path:
+            say("ok", "%s (%s)" % (tool, path))
+        else:
+            say("MISS", "%s -- %s" % (tool, hint))
+            ok = False
+    if find_skim():
+        say("ok", "Skim (%s)" % find_skim())
+    else:
+        say("MISS", "Skim -- brew install --cask skim")
+        ok = False
+    if shutil.which("pdfinfo"):
+        say("ok", "pdfinfo (poppler)")
+    else:
+        say("warn", "pdfinfo not found -- optional; brew install poppler "
+                    "(many paper Makefiles use it for page counts)")
+    return ok
+
+
+def configure_skim(zed):
+    prefs = [
+        ("SKAutoCheckFileUpdate", "-bool", "true"),
+        ("SKAutoReloadFileUpdate", "-bool", "true"),
+        ("SKTeXEditorPreset", "-string", ""),
+        ("SKTeXEditorCommand", "-string", zed),
+        ("SKTeXEditorArguments", "-string", '-e "%file":%line'),
+    ]
+    for key, kind, value in prefs:
+        subprocess.run(["defaults", "write", SKIM_DOMAIN, key, kind, value],
+                       check=True)
+    say("ok", "Skim: auto-reload on, Cmd-Shift-click opens Zed (%s)" % zed)
+    running = subprocess.run(["pgrep", "-x", "Skim"],
+                             capture_output=True).returncode == 0
+    if running:
+        say("note", "Skim is running; quit and reopen it to pick up the settings")
+
+
+def strip_line_comments(text):
+    # Zed's keymap is JSONC; drop whole-line // comments, then trailing commas.
+    text = "\n".join(l for l in text.splitlines()
+                     if not l.lstrip().startswith("//"))
+    return re.sub(r",(\s*[\]}])", r"\1", text)
+
+
+def configure_keymap():
+    snippet = json.dumps(KEYMAP_BLOCK, indent=2)
+    KEYMAP.parent.mkdir(parents=True, exist_ok=True)
+    text = KEYMAP.read_text() if KEYMAP.exists() else ""
+    if not text.strip():
+        KEYMAP.write_text(json.dumps([KEYMAP_BLOCK], indent=2) + "\n")
+        say("ok", "Zed keymap written (%s)" % KEYMAP)
+        return
+    if "latex: show line in Skim" in text:
+        say("ok", "Zed keymap already has the LaTeX bindings")
+        return
+    try:
+        data = json.loads(strip_line_comments(text))
+        assert isinstance(data, list)
+    except (ValueError, AssertionError):
+        say("warn", "could not parse %s; add this block to it by hand:" % KEYMAP)
+        print(snippet)
+        return
+    backup = KEYMAP.with_name("keymap.json.bak")
+    shutil.copy2(KEYMAP, backup)
+    data.append(KEYMAP_BLOCK)
+    KEYMAP.write_text(json.dumps(data, indent=2) + "\n")
+    say("ok", "Zed keymap: added Cmd-Alt-J / Cmd-Alt-B (backup: %s)" % backup)
+    if "//" in text:
+        say("note", "comments in the old keymap are only in the backup")
+
+
+def cmd_setup(args):
+    print("Checking tools")
+    ok = check_tools()
+    print("\nConfiguring")
+    zed = shutil.which("zed") or "/usr/local/bin/zed"
+    if find_skim():
+        configure_skim(zed)
+    configure_keymap()
+    print("\nDone." if ok else "\nDone, but install the missing tools above.")
+    print("Next: zed-latex init /path/to/your/paper")
+
+
+# ---- init -------------------------------------------------------------------
+
+def find_main_tex(root):
+    skip = {".git", "node_modules", ".zed"}
+    found = []
+    for dirpath, dirnames, filenames in os.walk(str(root)):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for name in filenames:
+            if not name.endswith(".tex"):
+                continue
+            path = Path(dirpath) / name
+            try:
+                head = path.read_text(errors="ignore")[:20000]
+            except OSError:
+                continue
+            if re.search(r"^[^%\n]*\\documentclass", head, re.M):
+                found.append(path)
+    if len(found) == 1:
+        return found[0]
+    mains = [p for p in found if p.name == "main.tex"]
+    if len(mains) == 1:
+        return mains[0]
+    return None if not found else found
+
+
+def fill(template, subs):
+    text = (TEMPLATES / template).read_text()
+    for key, value in subs.items():
+        text = text.replace("@" + key + "@", value)
+    return text
+
+
+def cmd_init(args):
+    root = Path(args.dir).resolve()
+    if not root.is_dir():
+        sys.exit("not a directory: %s" % root)
+
+    if args.main:
+        main = (root / args.main).resolve()
+        if not main.is_file():
+            sys.exit("main file not found: %s" % main)
+    else:
+        main = find_main_tex(root)
+        if main is None:
+            sys.exit("no .tex file with \\documentclass under %s; use --main" % root)
+        if isinstance(main, list):
+            sys.exit("several root documents found, pick one with --main:\n  " +
+                     "\n  ".join(str(p.relative_to(root)) for p in main))
+
+    main_rel = main.relative_to(root)
+    main_dir = main_rel.parent.as_posix()
+    main_dir = "" if main_dir == "." else "/" + main_dir
+    pdf_rel = main_rel.with_suffix(".pdf").as_posix()
+    makefile = main.parent / "Makefile"
+    has_make = makefile.exists()
+    has_check = has_make and re.search(r"^check\s*:", makefile.read_text(), re.M)
+
+    zed_dir = root / ".zed"
+    targets = ["settings.json", "tasks.json"]
+    existing = [t for t in targets if (zed_dir / t).exists()]
+    if existing and not args.force:
+        sys.exit("%s already has %s; rerun with --force to overwrite" %
+                 (zed_dir, ", ".join(existing)))
+
+    skim = find_skim() or Path("/Applications/Skim.app")
+    displayline = str(skim / "Contents/SharedSupport/displayline")
+    engine_flag = ENGINES[args.engine]
+
+    settings = fill("settings.json", {
+        "ENGINE_FLAG": engine_flag,
+        "DISPLAYLINE": displayline,
+    })
+
+    cwd = "$ZED_WORKTREE_ROOT" + main_dir
+    pdf = "$ZED_WORKTREE_ROOT/" + pdf_rel
+    if has_make:
+        build = {"label": "latex: build", "command": "make", "cwd": cwd}
+    else:
+        build = {"label": "latex: build", "command": "latexmk",
+                 "args": [engine_flag, "-interaction=nonstopmode",
+                          "-file-line-error", "-synctex=1", main_rel.name],
+                 "cwd": cwd}
+    build.update({"reveal": "no_focus", "hide": "on_success"})
+    tasks = [
+        {"label": "latex: show line in Skim", "command": displayline,
+         "args": ["-r", "$ZED_ROW", pdf, "$ZED_FILE"],
+         "reveal": "never", "hide": "always", "allow_concurrent_runs": True},
+        {"label": "latex: open PDF in Skim", "command": "open",
+         "args": ["-a", "Skim", pdf], "reveal": "never", "hide": "always"},
+        build,
+    ]
+    if has_check:
+        tasks.append({"label": "latex: check", "command": "make check",
+                      "cwd": cwd, "reveal": "always"})
+    tasks.append({
+        "label": "latex: list notes",
+        "command": "grep -rnE '%%[[:space:]]*(%s)[:( ]' --include='*.tex' . "
+                   "|| echo 'no notes'" % args.note_tags,
+        "cwd": cwd, "reveal": "always"})
+    if (root / ".git").exists():
+        tasks.insert(0, {"label": "latex: pull",
+                         "command": "git pull --rebase --autostash",
+                         "cwd": "$ZED_WORKTREE_ROOT",
+                         "reveal": "always", "hide": "on_success"})
+
+    zed_dir.mkdir(exist_ok=True)
+    (zed_dir / "settings.json").write_text(settings)
+    (zed_dir / "tasks.json").write_text(
+        "// Generated by zed-latex init. Run with Cmd-Shift-R.\n" +
+        json.dumps(tasks, indent=2) + "\n")
+    cheat = zed_dir / "README.md"
+    if not cheat.exists() or args.force:
+        cheat.write_text(fill("cheatsheet.md", {
+            "MAIN": main_rel.as_posix(),
+            "NOTE_TAGS": args.note_tags.replace("|", ", "),
+        }))
+    say("ok", "wrote %s (root document: %s)" % (zed_dir, main_rel))
+
+    exclude = root / ".git" / "info" / "exclude"
+    if args.share:
+        say("note", ".zed/ left visible to git; commit it to share with co-authors")
+    elif exclude.parent.exists():
+        lines = exclude.read_text().splitlines() if exclude.exists() else []
+        if ".zed/" not in lines:
+            with exclude.open("a") as f:
+                f.write("\n# local Zed config (zed-latex)\n.zed/\n")
+        say("ok", ".zed/ kept out of git via .git/info/exclude")
+
+    print("\nOpen it: zed %s   (cheat sheet: Cmd-P > .zed/README)" % root)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="zed-latex", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    s = sub.add_parser("setup", help="one-time machine setup")
+    s.set_defaults(func=cmd_setup)
+    i = sub.add_parser("init", help="configure a LaTeX project")
+    i.add_argument("dir", nargs="?", default=".", help="project root (default: .)")
+    i.add_argument("--main", help="root .tex file, relative to DIR (auto-detected)")
+    i.add_argument("--engine", choices=sorted(ENGINES), default="pdflatex")
+    i.add_argument("--note-tags", default=DEFAULT_NOTE_TAGS,
+                   help="comment tags for 'list notes' (default: %s)" % DEFAULT_NOTE_TAGS)
+    i.add_argument("--share", action="store_true",
+                   help="do not hide .zed/ from git (commit it for co-authors)")
+    i.add_argument("--force", action="store_true", help="overwrite an existing .zed/")
+    i.set_defaults(func=cmd_init)
+    args = p.parse_args()
+    if not getattr(args, "func", None):
+        p.print_help()
+        sys.exit(1)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
